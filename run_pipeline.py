@@ -3,10 +3,14 @@
 """Submit the complete ten-batch pipeline as one Lightning L4 Job."""
 
 import argparse
+import shlex
 import sys
 import time
 
 from lightning_sdk import Job, Machine, Studio
+
+REPO_URL = "https://github.com/kareemkamal10/app.git"
+PROJECT_DIR = "project"
 
 
 def stream_job(job):
@@ -26,7 +30,6 @@ def stream_job(job):
         if status in {"Status.Completed", "Status.Failed", "Status.Stopped"}:
             print(f"\nFinal status: {status}")
             return status
-
         time.sleep(5)
 
 
@@ -48,29 +51,32 @@ def main():
         org=args.org,
         create_ok=True,
     )
-    # Start the Studio on its lowest default machine only to provide the
-    # compute environment for the Job; the actual work is the L4 Job below.
     studio.start()
 
-    studio.run_with_exit_code(
-        "git pull --ff-only 2>/dev/null || true"
+    bootstrap = (
+        f"if [ -d {shlex.quote(PROJECT_DIR)}/.git ]; then "
+        f"cd {shlex.quote(PROJECT_DIR)} && git fetch origin && git reset --hard origin/main; "
+        f"else git clone {shlex.quote(REPO_URL)} {shlex.quote(PROJECT_DIR)}; fi"
     )
+    code = studio.run_with_exit_code(bootstrap)
+    if code != 0:
+        raise RuntimeError("Failed to clone/update the GitHub repository in the Studio.")
 
-    studio.run_with_exit_code(
-        "python -m pip install -r requirements.txt"
+    code = studio.run_with_exit_code(
+        f"cd {shlex.quote(PROJECT_DIR)} && python -m pip install -r requirements.txt"
     )
+    if code != 0:
+        raise RuntimeError("Failed to install project requirements.")
 
     command = (
-        "python batch_pipeline.py "
-        f"--json-source {args.json_source!r} "
-        f"--bucket {args.bucket!r} "
+        f"cd {shlex.quote(PROJECT_DIR)} && python batch_pipeline.py "
+        f"--json-source {shlex.quote(args.json_source)} "
+        f"--bucket {shlex.quote(args.bucket)} "
         f"--batch-count {args.batch_count} "
         f"--workers {args.workers} "
         f"--batch-size {args.batch_size}"
     )
 
-    # HF_TOKEN and PARQUET_PASSWORD are Teamspace secrets, so the Job gets
-    # them automatically as environment variables at runtime.
     job = Job.run(
         command=command,
         name="performers-batched-pipeline",
