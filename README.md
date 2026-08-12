@@ -1,130 +1,64 @@
-# تجهيز بيانات الأداء (Performers) قبل بناء مكتبة GhostFaceNetV2
+# Batched performer image pipeline
 
-المشروع ده بيعمل خطوتين تجهيز قبل مرحلة بناء متجهات الوجوه (face embeddings):
+This version processes the dataset in 10 deterministic batches.
 
-1. **تحميل الصور** من ملف الـ JSON وتنظيمها في مجلدات باسم `id` + تقرير كامل.
-2. **فحص وجود وجه** في صور الأشخاص أصحاب "صورة واحدة" باستخدام YOLOv11l-face + تقرير كامل.
+For every batch:
 
-كل الأكواد اتبنت واتاختبرت فعلياً (مش نظرية) — التفاصيل في آخر الملف.
+1. Download original images.
+2. Write a batch download report.
+3. Run YOLOv11l-face.
+4. Write a batch face-detection report.
+5. Package the ORIGINAL downloaded image bytes into a Parquet file.
+6. Encrypt the complete Parquet file with AES-256-GCM using a key derived from `PARQUET_PASSWORD`.
+7. Upload the encrypted package and the batch face report to the Hugging Face Bucket.
+8. Verify the remote files.
+9. Delete local batch images and the temporary encrypted package.
+10. Continue to the next batch.
 
----
+At the end, upload the master download report.
 
-## 1) تحميل الصور — `01_download_images.py`
+## Secrets
 
-```bash
-pip install -r requirements.txt
+Create these Teamspace secrets in Lightning:
 
-python 01_download_images.py \
-    --json-source "https://huggingface.co/datasets/abdelwahabnabil500/datafile/resolve/main/stashdb_performers_full.json" \
-    --output-dir ./downloads \
-    --report-dir ./reports \
-    --workers 16
+- `HF_TOKEN`
+- `PARQUET_PASSWORD`
+
+Do not put either secret in GitHub.
+
+## Run
+
+From a local PowerShell terminal:
+
+```powershell
+$env:LIGHTNING_USER_ID="YOUR_USER_ID"
+$env:LIGHTNING_API_KEY="YOUR_API_KEY"
+
+python run_pipeline.py `
+  --teamspace "deploy-model-project" `
+  --org "kareemkamal500-org" `
+  --json-source "https://huggingface.co/datasets/abdelwahabnabil500/datafile/resolve/main/stashdb_performers_full.json" `
+  --bucket "abdelwahabnabil500/faces" `
+  --studio-name "performers-pipeline" `
+  --batch-count 10 `
+  --workers 16 `
+  --batch-size 32
 ```
 
-### أهم الخيارات
-| الخيار | الوظيفة | الافتراضي |
-|---|---|---|
-| `--workers` | عدد التحميلات المتوازية | 16 |
-| `--retries` | إعادة المحاولة عند فشل الشبكة | 3 |
-| `--min-bytes` | أقل حجم للصورة عشان تُعتبر ناجحة | 512 |
-| `--force` | إعادة تحميل حتى لو الصورة موجودة | معطّل (فيه استئناف تلقائي) |
-| `--limit N` | تجربة أول N شخص بس (اختباري) | بدون حد |
+The Studio provides the environment for the L4 Job. The work itself runs in the L4 Job.
 
-### الناتج
-```
-downloads/
-  019ff254-4e18-7a93-bc77-746ed2b43769/
-    001.jpg
-  <id-تاني>/
-    001.jpg
-    002.jpg
-reports/
-  download_report.json
-  download_report.md
-```
+## Important encryption note
 
-تقرير `download_report.md` بيوضّح:
-- توزيع عدد الصور لكل شخص (0 / 1 / 2 / ...).
-- **عدد أصحاب الصورة الواحدة، وكام منهم فشل تحميل صورته، وأسماءهم وIDs**.
-- إحصائيات عامة عن كل الصور.
+The uploaded file has the suffix `.parquet.enc`. It contains a valid Parquet file encrypted as an AES-256-GCM envelope. The plaintext Parquet exists only temporarily on the worker and is deleted immediately after encryption.
 
-ملف `download_report.json` فيه كمان `single_image_performers.success_list` وهو
-المدخل اللي بتستخدمه المرحلة الثانية مباشرة.
+The password is the same logical password for all batches, but each batch derives a distinct encryption key using PBKDF2-HMAC-SHA256 with a batch-specific salt.
 
----
+## Resume behavior
 
-## 2) فحص الوجوه — `02_detect_faces.py`
+Each successfully uploaded batch creates:
 
-السكربت ده اتصمم يشتغل على **Kaggle GPU**. لازم تشغّل المرحلة الأولى الأول
-(أو على الأقل تكون ناقل مجلد `downloads/` + `reports/download_report.json`
-لـ Kaggle).
+`pipeline_work/state/batch_XX.uploaded.ok`
 
-### على Kaggle (notebook, GPU: T4 x1 أو أي GPU متاح)
-```python
-!pip install -q ultralytics
+If the Job is restarted in the same persistent Studio, completed batches are skipped.
 
-!python 02_detect_faces.py \
-    --download-report /kaggle/working/reports/download_report.json \
-    --report-dir /kaggle/working/reports \
-    --device 0
-```
-
-> لازم يكون **Internet** مفعّل في إعدادات الـ Notebook عشان السكربت يقدر
-> ينزّل وزن الموديل تلقائياً من GitHub (48.8MB، مرة واحدة بس).
-> لو الإنترنت مقفول وقت التشغيل، حمّل الملف يدوياً وحطه في مسار وحدد
-> مكانه بـ `--weights /path/to/yolov11l-face.pt`.
-
-### لماذا YOLOv11l-face تحديداً؟
-- Fine-tuned خصيصاً لكشف الوجوه (مش موديل عام)، ونسخة **l** (الأكبر) لأعلى دقة.
-- **اتاختبر فعلياً** على صورة "أكبر سيلفي جماعي بالعالم" (~300 شخص، وجوه
-  صغيرة جداً ومتراكبة) واكتشف الوجوه بدقة عالية (confidence ~90%) —
-  يعني قوي فعلاً في الحالات الصعبة اللي ذكرتها.
-- مبني على Ultralytics القياسية → خفيف وسريع على أي GPU في Kaggle.
-
-السكربت بيعمل **محاولتين** لكل صورة عشان يقلل الأخطاء في الحالات الصعبة:
-1. `imgsz=1280, conf=0.25` (المحاولة الأساسية).
-2. لو مفيش وجه اتكشف: `imgsz=1600, conf=0.10` (محاولة أكثر تساهلاً
-   للوجه الجزئي/الزاوية الصعبة/الإضاءة السيئة).
-
-### الناتج
-```
-reports/
-  face_detection_report.json
-  face_detection_report.md
-```
-
-وبيوضّح:
-- إجمالي الصور المفحوصة (أصحاب الصورة الواحدة اللي نجح تحميلهم فقط).
-- كام واحد اتكشفله وجه، وكام واحد **معرفش يتكشفله وجه** + أسماءهم وIDs.
-- تفاصيل خام لكل صورة (`all_results`): عدد الوجوه، أعلى نسبة ثقة، أي
-  محاولة (pass1/pass2) نجحت — ده هيفيدك لاحقاً لو حبيت تراجع/تظبط العتبات.
-
----
-
-## ملاحظة لمرحلة بناء المتجهات (GhostFaceNetV2) لاحقاً
-
-الفحص الحالي بيجاوب بس على سؤال "فيه وجه ولا لأ". لما توصل فعلياً لمرحلة
-استخراج الـ embeddings بـ GhostFaceNetV2، الدقة بتتحسن كتير لو الوجه
-اتقص ومحاذي (aligned) باستخدام 5 نقاط دالة (landmarks)، مش bbox عادي.
-YOLOv11l-face هنا بيديك bounding box بس بدون landmarks، فلو حبيت محاذاة
-دقيقة وقتها، فكّر في:
-- **RetinaFace** أو **SCRFD** (من مكتبة `insightface`) — بيديوا landmarks
-  جاهزة ومصمّمين أصلاً للعمل قبل شبكات ArcFace-family زي GhostFaceNetV2.
-- أو نسخة مدرّبة من YOLO-face بها pose/keypoints لو لقيت واحدة موثوقة.
-
-مفيش داعي تعمل حاجة في المرحلة دي دلوقتي — بس خليها في بالك وانت بتخطط
-للخطوة الجاية.
-
----
-
-## إيه اللي اتاختبر فعلياً قبل التسليم
-
-- **سكربت التحميل**: جرّبته على بيانات محاكاة (صور ناجحة / 404 / ملف
-  تالف صغير) عبر سيرفر محلي، وطابقت النتائج المتوقعة 100% (تعداد
-  أصحاب الصورة الواحدة، نجاح/فشل، الأسماء).
-- **سكربت الكشف**: نزّلت وزن YOLOv11l-face فعلياً من GitHub وشغّلته على:
-  - صورة حقيقية فيها ~300 وجه (كشفها بنجاح، ثقة ~90%).
-  - صورة فاضية بدون وجه (اتصنّفت صح "لا يوجد وجه" حتى بعد المحاولة الثانية).
-
-الرابط اللي اتأكد إنه شغال لوزن الموديل:
-`https://github.com/akanametov/yolo-face/releases/download/1.0.0/yolov11l-face.pt`
+A failed upload must complete successfully before its local images are deleted.

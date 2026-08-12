@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+pipeline_work/
+downloads/
+reports/
+package/
+weights/
+.env
