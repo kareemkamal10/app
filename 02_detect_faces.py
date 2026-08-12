@@ -5,19 +5,25 @@
 import argparse
 import json
 import logging
+import time
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.request import urlretrieve
 
+import requests
 from ultralytics import YOLO
 
 LOG = logging.getLogger("detect_faces")
 
-WEIGHTS_URL = (
-    "https://github.com/akanametov/yolo-face/releases/download/"
-    "1.0.0/yolov11l-face.pt"
-)
+# Primary + fallback mirror. GitHub release assets (served off
+# objects.githubusercontent.com) sometimes stall indefinitely from Kaggle
+# with no error — a plain urlretrieve() has no timeout and will hang
+# forever in that case, so we use requests with an explicit timeout,
+# retries, and a second source to fall back to.
+WEIGHTS_URLS = [
+    "https://github.com/akanametov/yolo-face/releases/download/1.0.0/yolov11l-face.pt",
+    "https://huggingface.co/deepghs/yolo-face/resolve/main/yolov11l-face/model.pt",
+]
 
 
 @dataclass
@@ -31,13 +37,54 @@ class Outcome:
     pass_used: str
 
 
+def _download_with_timeout(url: str, dest: Path, connect_timeout=15, read_timeout=30, retries=3) -> None:
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    last_exc = None
+    for attempt in range(1, retries + 1):
+        try:
+            with requests.get(url, stream=True, timeout=(connect_timeout, read_timeout)) as r:
+                r.raise_for_status()
+                total = int(r.headers.get("Content-Length", 0))
+                downloaded = 0
+                last_log = time.monotonic()
+                with open(tmp, "wb") as f:
+                    for chunk in r.iter_content(1 << 20):
+                        if not chunk:
+                            continue
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        now = time.monotonic()
+                        if now - last_log > 5:
+                            pct = f" ({downloaded * 100 // total}%)" if total else ""
+                            LOG.info("  ...%d MB%s", downloaded // (1 << 20), pct)
+                            last_log = now
+            if total and tmp.stat().st_size != total:
+                raise IOError(f"Incomplete download: got {tmp.stat().st_size} of {total} bytes")
+            tmp.rename(dest)
+            return
+        except Exception as exc:
+            last_exc = exc
+            LOG.warning("Attempt %d/%d from %s failed: %s", attempt, retries, url, exc)
+            tmp.unlink(missing_ok=True)
+            time.sleep(2 * attempt)
+    raise RuntimeError(f"Failed to download from {url} after {retries} attempts") from last_exc
+
+
 def ensure_weights(path: Path) -> Path:
     if path.exists() and path.stat().st_size > 1_000_000:
         return path
     path.parent.mkdir(parents=True, exist_ok=True)
-    LOG.info("Downloading YOLO weights...")
-    urlretrieve(WEIGHTS_URL, str(path))
-    return path
+    errors = []
+    for url in WEIGHTS_URLS:
+        LOG.info("Downloading YOLO weights from %s ...", url)
+        try:
+            _download_with_timeout(url, path)
+            LOG.info("Downloaded weights: %d MB", path.stat().st_size // (1 << 20))
+            return path
+        except Exception as exc:
+            LOG.warning("Source failed (%s), trying next mirror if any...", exc)
+            errors.append(str(exc))
+    raise RuntimeError("Could not download YOLO weights from any source: " + "; ".join(errors))
 
 
 def load_download_report(path: Path) -> list[dict]:
