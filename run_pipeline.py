@@ -43,6 +43,8 @@ def main():
     ap.add_argument("--batch-count", type=int, default=10)
     ap.add_argument("--workers", type=int, default=16)
     ap.add_argument("--batch-size", type=int, default=32)
+    ap.add_argument("--devices", default="0,1",
+                    help="Comma-separated GPU ids passed to batch_pipeline.py, e.g. '0,1'.")
     args = ap.parse_args()
 
     studio = Studio(
@@ -74,6 +76,7 @@ def main():
         f"--bucket {shlex.quote(args.bucket)} "
         f"--batch-count {args.batch_count} "
         f"--workers {args.workers} "
+        f"--devices {shlex.quote(args.devices)} "
         f"--batch-size {args.batch_size}"
     )
 
