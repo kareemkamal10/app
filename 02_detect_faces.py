@@ -95,7 +95,10 @@ def load_download_report(path: Path) -> list[dict]:
 
 def predict_pass(model, entries, imgsz, conf, batch_size, device):
     outcomes = []
-    for start in range(0, len(entries), batch_size):
+    total = len(entries)
+    LOG.info("Running detection on %d images (mini-batch=%d)...", total, batch_size)
+    start_time = time.monotonic()
+    for start in range(0, total, batch_size):
         batch = entries[start:start + batch_size]
         paths = [e["path"] for e in batch]
         results = model.predict(
@@ -106,6 +109,14 @@ def predict_pass(model, entries, imgsz, conf, batch_size, device):
             n = len(res.boxes)
             best = float(res.boxes.conf.max()) if n else None
             outcomes.append((e, n, best))
+        done = start + len(batch)
+        elapsed = time.monotonic() - start_time
+        rate = done / elapsed if elapsed > 0 else 0
+        eta = (total - done) / rate if rate > 0 else 0
+        LOG.info(
+            "  %d/%d images (%.1f%%) | %.1f img/s | ETA %.0fs",
+            done, total, 100 * done / total, rate, eta
+        )
     return outcomes
 
 
