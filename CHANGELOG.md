@@ -65,10 +65,17 @@ JSON performer records
 → update checkpoint
 → delete local batch
 → continue to the next batch
-### Bucket checkpoint / resume repair
 
-- Fixed checkpoint uploads to use the Hugging Face Bucket API.
-- Fixed checkpoint downloads and remote production-batch checks to use Bucket APIs.
-- Added recovery for production batches that are already uploaded but missing from the master checkpoint.
-- Batch 00 from the smoke test is ignored by production resume logic.
-- Local completion markers are written only after a checkpoint upload succeeds.
+### Long-run reliability hardening
+
+- Fixed HTTP retry configuration so `Retry(...)` is actually attached to the `HTTPAdapter`.
+- Added per-image download retries with exponential backoff.
+- A small number of permanently failed image URLs no longer aborts an otherwise successful batch; failures remain recorded and are retried automatically if the same batch is run again.
+- Cache the performer JSON locally once per pipeline run so later batches do not depend on repeated Hugging Face downloads.
+- Changed Parquet packaging to chunked `ParquetWriter` output to avoid loading an entire multi-GB batch into RAM.
+- Added atomic temporary Parquet output so a failed package cannot leave a misleading partial `.parquet` file.
+- Added retry and size-aware verification to Bucket uploads; already matching remote files are not re-uploaded.
+- Made master checkpoint uploads use the Hugging Face Bucket API with retries and verification.
+- Master checkpoint download/resume now uses the Bucket API instead of the Dataset API.
+- The local batch-completion marker is written only after the master checkpoint has been uploaded successfully.
+- Added recovery for a remotely completed batch whose checkpoint record was not written before a prior process stopped.

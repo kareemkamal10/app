@@ -19,7 +19,6 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-import tempfile
 
 
 def run(cmd, env=None):
@@ -30,117 +29,59 @@ def run(cmd, env=None):
 
 
 def upload_master_report(bucket: str, report: Path, token: str, remote_name: str):
-    """Upload a small checkpoint file to the Hugging Face Bucket."""
-    from huggingface_hub import batch_bucket_files, get_bucket_paths_info
-
-    batch_bucket_files(bucket, add=[(report, remote_name)], token=token)
-    infos = list(get_bucket_paths_info(bucket, [remote_name], token=token))
-    found = {x.path: x for x in infos}
-    if remote_name not in found:
-        raise RuntimeError(f"Remote checkpoint upload failed: {remote_name} not found.")
-    if found[remote_name].size != report.stat().st_size:
-        raise RuntimeError(
-            f"Remote checkpoint size mismatch for {remote_name}: "
-            f"local={report.stat().st_size}, remote={found[remote_name].size}"
-        )
+    from huggingface_hub import HfApi
+    api = HfApi(token=token)
+    api.upload_file(
+        path_or_fileobj=str(report),
+        path_in_repo=remote_name,
+        repo_id=bucket,
+        repo_type="dataset",
+    )
+    api.get_paths_info(repo_id=bucket, repo_type="dataset", paths=[remote_name])
 
 
 def fetch_remote_master(bucket: str, token: str) -> dict | None:
-    """Download the checkpoint master report from the Hugging Face Bucket."""
-    from huggingface_hub import HfApi
+    """Download the checkpoint master report from the bucket, if one exists.
 
-    remote_name = "final/download_master_report.json"
-    api = HfApi(token=token)
+    Kaggle sessions do not keep local disk between restarts, so resume state
+    must live on the remote bucket rather than in ./pipeline_work/state.
+    """
+    from huggingface_hub import hf_hub_download
+    from huggingface_hub.utils import EntryNotFoundError, RepositoryNotFoundError
+
     try:
-        infos = list(api.get_bucket_paths_info(bucket, [remote_name], token=token))
-        if not any(info.path == remote_name for info in infos):
-            return None
-        tmp = Path(tempfile.gettempdir()) / "performer_pipeline_master_checkpoint.json"
-        api.download_bucket_files(bucket, [(remote_name, tmp)], token=token, raise_on_missing_files=True)
-        with open(tmp, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as exc:
-        print(f"Could not check/download remote checkpoint (continuing without it): {exc}")
+        path = hf_hub_download(
+            repo_id=bucket,
+            repo_type="dataset",
+            filename="final/download_master_report.json",
+            token=token,
+        )
+    except (EntryNotFoundError, RepositoryNotFoundError):
         return None
-    finally:
-        try:
-            tmp.unlink(missing_ok=True)
-        except UnboundLocalError:
-            pass
+    except Exception as exc:
+        print(f"Could not check remote checkpoint (continuing without it): {exc}")
+        return None
+
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 
 def remote_batch_complete(bucket: str, token: str, batch: int) -> bool:
-    """Check the Hugging Face Bucket directly for a production batch."""
-    from huggingface_hub import get_bucket_paths_info
-
-    prefix = f"batches/batch_{batch:02d}"
-    paths = [
-        f"{prefix}/batch_{batch:02d}.parquet",
-        f"{prefix}/batch_{batch:02d}_face_detection_report.json",
-    ]
-    try:
-        found = {x.path for x in get_bucket_paths_info(bucket, paths, token=token)}
-        return all(path in found for path in paths)
-    except Exception:
-        return False
-
-
-def recover_remote_batch(bucket: str, token: str, batch: int, reports: Path) -> dict | None:
-    """Recover metadata for an uploaded production batch when its checkpoint is missing."""
+    """Check the bucket directly for a batch's package + face report."""
     from huggingface_hub import HfApi
-
+    api = HfApi(token=token)
     prefix = f"batches/batch_{batch:02d}"
     package_remote = f"{prefix}/batch_{batch:02d}.parquet"
-    face_remote = f"{prefix}/batch_{batch:02d}_face_detection_report.json"
-    api = HfApi(token=token)
-
+    report_remote = f"{prefix}/batch_{batch:02d}_face_detection_report.json"
     try:
-        found = {x.path for x in api.get_bucket_paths_info(
-            bucket, [package_remote, face_remote], token=token
-        )}
-        if package_remote not in found or face_remote not in found:
-            return None
-
-        local_download = reports / f"batch_{batch:02d}_download_report.json"
-        local_face = reports / f"batch_{batch:02d}_face_detection_report.json"
-        if local_download.exists() and local_face.exists():
-            with open(local_download, "r", encoding="utf-8") as f:
-                dr = json.load(f)
-            with open(local_face, "r", encoding="utf-8") as f:
-                fr = json.load(f)
-            return {
-                "batch_index": batch,
-                "listed_images": dr["listed_images_in_batch"],
-                "download_success": dr["download_success"],
-                "download_failed": dr["download_failed"],
-                "face_detected": fr["face_detected"],
-                "face_not_detected": fr["face_not_detected"],
-                "download_report": local_download.name,
-                "face_report": local_face.name,
-                "parquet": package_remote,
-            }
-
-        tmp = Path(tempfile.gettempdir()) / f"batch_{batch:02d}_face_report.json"
-        api.download_bucket_files(bucket, [(face_remote, tmp)], token=token, raise_on_missing_files=True)
-        with open(tmp, "r", encoding="utf-8") as f:
-            fr = json.load(f)
-        tmp.unlink(missing_ok=True)
-        results = fr.get("all_results", [])
-        failed = sum(1 for row in results if row.get("pass_used") == "missing_file")
-        return {
-            "batch_index": batch,
-            "listed_images": fr.get("total_checked", len(results)),
-            "download_success": len(results) - failed,
-            "download_failed": failed,
-            "face_detected": fr["face_detected"],
-            "face_not_detected": fr["face_not_detected"],
-            "download_report": f"batch_{batch:02d}_download_report.json",
-            "face_report": Path(face_remote).name,
-            "parquet": package_remote,
-        }
-    except Exception as exc:
-        print(f"Could not recover remote batch {batch:02d}: {exc}")
-        return None
+        infos = list(api.get_paths_info(
+            repo_id=bucket, repo_type="dataset",
+            paths=[package_remote, report_remote],
+        ))
+    except Exception:
+        return False
+    found = {x.path for x in infos}
+    return package_remote in found and report_remote in found
 
 
 def checkpoint_master_report(master: dict, reports: Path, bucket: str, token: str):
@@ -168,7 +109,13 @@ def checkpoint_master_report(master: dict, reports: Path, bucket: str, token: st
         f.write("\n".join(lines))
 
     upload_master_report(bucket, master_path, token, "final/download_master_report.json")
-    upload_master_report(bucket, master_md, token, "final/download_master_report.md")
+    from huggingface_hub import HfApi
+    HfApi(token=token).upload_file(
+        path_or_fileobj=str(master_md),
+        path_in_repo="final/download_master_report.md",
+        repo_id=bucket,
+        repo_type="dataset",
+    )
 
 
 def main():
@@ -214,26 +161,9 @@ def main():
             "batches": [],
         }
 
-    # Recover any already-uploaded production batches missing from the checkpoint.
-    known_batches = {
-        b.get("batch_index")
-        for b in master.get("batches", [])
-        if str(b.get("parquet", "")).endswith(".parquet")
-    }
-    for existing_batch in range(1, args.batch_count + 1):
-        if existing_batch in known_batches:
-            continue
-        recovered = recover_remote_batch(args.bucket, token, existing_batch, reports)
-        if recovered is not None:
-            master["batches"].append(recovered)
-    master["batches"].sort(key=lambda b: b["batch_index"])
-    if master["batches"]:
-        print("Recognized production batches already on the Bucket: " + ", ".join(
-            f"{b['batch_index']:02d}" for b in master["batches"]
-        ))
-
     # Only treat a checkpoint as complete when it points to the current
-    # plaintext Parquet format only.
+    # plaintext Parquet format. Older checkpoints may contain .parquet.enc
+    # from the previous encrypted version and must be rebuilt.
     done_batches = {
         b["batch_index"]
         for b in master["batches"]
@@ -242,8 +172,7 @@ def main():
 
     for batch in range(1, args.batch_count + 1):
         marker = state / f"batch_{batch:02d}.uploaded.ok"
-        remote_done = remote_batch_complete(args.bucket, token, batch)
-        if batch in done_batches or remote_done or (marker.exists() and remote_done):
+        if batch in done_batches or marker.exists() or remote_batch_complete(args.bucket, token, batch):
             print(f"Batch {batch:02d} already uploaded (local or remote checkpoint); skipping.")
             marker.write_text(datetime.now(timezone.utc).isoformat(), encoding="utf-8")
             continue
@@ -297,6 +226,10 @@ def main():
         if parquet.exists():
             parquet.unlink()
 
+        marker.write_text(
+            datetime.now(timezone.utc).isoformat(), encoding="utf-8"
+        )
+
         with open(download_report, "r", encoding="utf-8") as f:
             dr = json.load(f)
         with open(face_report, "r", encoding="utf-8") as f:
@@ -319,9 +252,6 @@ def main():
         # Checkpoint after every batch: this is the file a restarted Kaggle
         # session downloads at the top of main() to know what's already done.
         checkpoint_master_report(master, reports, args.bucket, token)
-        marker.write_text(
-            datetime.now(timezone.utc).isoformat(), encoding="utf-8"
-        )
         print(f"Checkpoint uploaded after batch {batch:02d}.")
 
     master["completed_at"] = datetime.now(timezone.utc).isoformat()
