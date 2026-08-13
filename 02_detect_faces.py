@@ -93,17 +93,20 @@ def load_download_report(path: Path) -> list[dict]:
     return report.get("successful_images", [])
 
 
-def predict_pass(model, entries, imgsz, conf, batch_size, device, augment):
+def predict_pass(model, entries, imgsz, conf, batch_size, device, augment, half=True):
     outcomes = []
     total = len(entries)
-    LOG.info("Running detection on %d images (mini-batch=%d, augment=%s)...", total, batch_size, augment)
+    LOG.info(
+        "Running detection on %d images (mini-batch=%d, augment=%s, half=%s)...",
+        total, batch_size, augment, half
+    )
     start_time = time.monotonic()
     for start in range(0, total, batch_size):
         batch = entries[start:start + batch_size]
         paths = [e["path"] for e in batch]
         results = model.predict(
             paths, imgsz=imgsz, conf=conf, device=device,
-            augment=augment, verbose=False, stream=True
+            augment=augment, half=half, verbose=False, stream=True
         )
         for e, res in zip(batch, results):
             n = len(res.boxes)
@@ -131,6 +134,12 @@ def main() -> int:
     ap.add_argument("--fallback-imgsz", type=int, default=1280)
     ap.add_argument("--fallback-conf", type=float, default=0.10)
     ap.add_argument("--batch-size", type=int, default=32)
+    ap.add_argument("--fallback-batch-size", type=int, default=8,
+                     help="Smaller than --batch-size: the fallback pass runs augment=True (TTA), "
+                          "which multiplies per-image GPU memory use, and it also uses a larger imgsz.")
+    ap.add_argument("--no-half", action="store_true",
+                     help="Disable FP16 inference. Only useful if you hit numerical issues; "
+                          "T4 supports FP16 natively and it roughly doubles throughput.")
     ap.add_argument("--batch-index", type=int, required=True)
     args = ap.parse_args()
 
@@ -139,8 +148,9 @@ def main() -> int:
     valid = [e for e in entries if e.get("path") and Path(e["path"]).exists()]
     missing = [e for e in entries if not (e.get("path") and Path(e["path"]).exists())]
 
+    half = not args.no_half
     model = YOLO(str(ensure_weights(Path(args.weights))))
-    p1 = predict_pass(model, valid, args.imgsz, args.conf, args.batch_size, args.device, augment=False)
+    p1 = predict_pass(model, valid, args.imgsz, args.conf, args.batch_size, args.device, augment=False, half=half)
 
     outcomes = []
     fallback = []
@@ -154,10 +164,16 @@ def main() -> int:
             fallback.append(e)
 
     if fallback:
+        # Free whatever pass 1 is still holding before the heavier TTA pass.
+        try:
+            import torch
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
         LOG.info("Fallback pass: %d images", len(fallback))
         p2 = predict_pass(
             model, fallback, args.fallback_imgsz, args.fallback_conf,
-            args.batch_size, args.device, augment=True
+            args.fallback_batch_size, args.device, augment=True, half=half
         )
         for e, n, best in p2:
             outcomes.append(Outcome(
