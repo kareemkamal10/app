@@ -55,7 +55,7 @@ def main() -> int:
     ap.add_argument("--image-count", type=int, default=100)
     ap.add_argument("--work-dir", default="/kaggle/temp/pipeline_smoke_test")
     ap.add_argument("--workers", type=int, default=16)
-    ap.add_argument("--device", default="0")
+    ap.add_argument("--devices", default="0")
     ap.add_argument("--batch-size", type=int, default=32)
     args = ap.parse_args()
 
@@ -136,7 +136,7 @@ def main() -> int:
         "--download-report", str(download_report),
         "--report-dir", str(reports),
         "--batch-index", "0",
-        "--device", args.device,
+        "--devices", args.devices,
         "--batch-size", str(args.batch_size),
     ])
 

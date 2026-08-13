@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Run YOLOv11l-face against the images successfully downloaded in one batch."""
+"""Run YOLOv11l-face against the images successfully downloaded in one batch.
+
+Supports splitting the batch across multiple GPUs (e.g. Kaggle's T4 x2):
+each device gets its own subprocess with its own model instance, and both
+run pass 1 + the fallback pass independently on their shard of the images.
+"""
 
 import argparse
 import json
 import logging
+import multiprocessing as mp
 import time
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
-from ultralytics import YOLO
 
 LOG = logging.getLogger("detect_faces")
 
@@ -93,12 +98,12 @@ def load_download_report(path: Path) -> list[dict]:
     return report.get("successful_images", [])
 
 
-def predict_pass(model, entries, imgsz, conf, batch_size, device, augment, half=True):
+def predict_pass(model, entries, imgsz, conf, batch_size, device, augment, quantize=16, log=LOG):
     outcomes = []
     total = len(entries)
-    LOG.info(
-        "Running detection on %d images (mini-batch=%d, augment=%s, half=%s)...",
-        total, batch_size, augment, half
+    log.info(
+        "Running detection on %d images (mini-batch=%d, augment=%s, quantize=%s)...",
+        total, batch_size, augment, quantize
     )
     start_time = time.monotonic()
     for start in range(0, total, batch_size):
@@ -106,7 +111,7 @@ def predict_pass(model, entries, imgsz, conf, batch_size, device, augment, half=
         paths = [e["path"] for e in batch]
         results = model.predict(
             paths, imgsz=imgsz, conf=conf, device=device,
-            augment=augment, half=half, verbose=False, stream=True
+            augment=augment, quantize=quantize, verbose=False, stream=True
         )
         for e, res in zip(batch, results):
             n = len(res.boxes)
@@ -116,11 +121,58 @@ def predict_pass(model, entries, imgsz, conf, batch_size, device, augment, half=
         elapsed = time.monotonic() - start_time
         rate = done / elapsed if elapsed > 0 else 0
         eta = (total - done) / rate if rate > 0 else 0
-        LOG.info(
+        log.info(
             "  %d/%d images (%.1f%%) | %.1f img/s | ETA %.0fs",
             done, total, 100 * done / total, rate, eta
         )
     return outcomes
+
+
+def process_shard(entries, device, args_dict, log_prefix):
+    """Run pass 1 + fallback for one device's shard of images. Runs inside
+    its own subprocess (one per GPU) so each has an isolated CUDA context."""
+    from ultralytics import YOLO
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format=f"%(asctime)s | %(levelname)s | [{log_prefix}] %(message)s",
+        force=True,
+    )
+    log = logging.getLogger(f"detect_faces.{log_prefix}")
+
+    quantize = 16 if args_dict["half"] else None
+    model = YOLO(str(ensure_weights(Path(args_dict["weights"]))))
+    p1 = predict_pass(
+        model, entries, args_dict["imgsz"], args_dict["conf"], args_dict["batch_size"],
+        device, augment=False, quantize=quantize, log=log
+    )
+
+    outcomes = []
+    fallback = []
+    for e, n, best in p1:
+        if n:
+            outcomes.append(Outcome(str(e["performer_id"]), e["performer_name"], e["path"], True, n, best, "pass1"))
+        else:
+            fallback.append(e)
+
+    if fallback:
+        try:
+            import torch
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+        log.info("Fallback pass: %d images", len(fallback))
+        p2 = predict_pass(
+            model, fallback, args_dict["fallback_imgsz"], args_dict["fallback_conf"],
+            args_dict["fallback_batch_size"], device, augment=True, quantize=quantize, log=log
+        )
+        for e, n, best in p2:
+            outcomes.append(Outcome(
+                str(e["performer_id"]), e["performer_name"], e["path"],
+                bool(n), n, best, "pass2_fallback" if n else "none"
+            ))
+
+    return [asdict(o) for o in outcomes]
 
 
 def main() -> int:
@@ -128,18 +180,21 @@ def main() -> int:
     ap.add_argument("--download-report", required=True)
     ap.add_argument("--report-dir", default="./reports")
     ap.add_argument("--weights", default="./weights/yolov11l-face.pt")
-    ap.add_argument("--device", default="0")
+    ap.add_argument("--devices", default="0",
+                     help="Comma-separated GPU ids to split the batch across, e.g. '0,1' for Kaggle's T4 x2. "
+                          "Each device runs its own subprocess with its own model instance.")
     ap.add_argument("--imgsz", type=int, default=960)
     ap.add_argument("--conf", type=float, default=0.25)
     ap.add_argument("--fallback-imgsz", type=int, default=1280)
     ap.add_argument("--fallback-conf", type=float, default=0.10)
-    ap.add_argument("--batch-size", type=int, default=32)
+    ap.add_argument("--batch-size", type=int, default=64,
+                     help="Mini-batch for the main (no-augment) pass. T4s handle large batches fine here.")
     ap.add_argument("--fallback-batch-size", type=int, default=8,
                      help="Smaller than --batch-size: the fallback pass runs augment=True (TTA), "
                           "which multiplies per-image GPU memory use, and it also uses a larger imgsz.")
     ap.add_argument("--no-half", action="store_true",
                      help="Disable FP16 inference. Only useful if you hit numerical issues; "
-                          "T4 supports FP16 natively and it roughly doubles throughput.")
+                          "T4 supports FP16 natively via Tensor Cores and it roughly doubles throughput.")
     ap.add_argument("--batch-index", type=int, required=True)
     args = ap.parse_args()
 
@@ -148,38 +203,45 @@ def main() -> int:
     valid = [e for e in entries if e.get("path") and Path(e["path"]).exists()]
     missing = [e for e in entries if not (e.get("path") and Path(e["path"]).exists())]
 
-    half = not args.no_half
-    model = YOLO(str(ensure_weights(Path(args.weights))))
-    p1 = predict_pass(model, valid, args.imgsz, args.conf, args.batch_size, args.device, augment=False, half=half)
+    devices = [d.strip() for d in args.devices.split(",") if d.strip()]
 
-    outcomes = []
-    fallback = []
-    for e, n, best in p1:
-        if n:
-            outcomes.append(Outcome(
-                str(e["performer_id"]), e["performer_name"], e["path"],
-                True, n, best, "pass1"
-            ))
-        else:
-            fallback.append(e)
+    # Pre-download weights once here, before any workers start -- otherwise
+    # multiple GPU subprocesses could race to write the same file at once.
+    ensure_weights(Path(args.weights))
 
-    if fallback:
-        # Free whatever pass 1 is still holding before the heavier TTA pass.
-        try:
-            import torch
-            torch.cuda.empty_cache()
-        except Exception:
-            pass
-        LOG.info("Fallback pass: %d images", len(fallback))
-        p2 = predict_pass(
-            model, fallback, args.fallback_imgsz, args.fallback_conf,
-            args.fallback_batch_size, args.device, augment=True, half=half
-        )
-        for e, n, best in p2:
-            outcomes.append(Outcome(
-                str(e["performer_id"]), e["performer_name"], e["path"],
-                bool(n), n, best, "pass2_fallback" if n else "none"
-            ))
+    args_dict = {
+        "weights": args.weights, "imgsz": args.imgsz, "conf": args.conf,
+        "fallback_imgsz": args.fallback_imgsz, "fallback_conf": args.fallback_conf,
+        "batch_size": args.batch_size, "fallback_batch_size": args.fallback_batch_size,
+        "half": not args.no_half,
+    }
+
+    # Split contiguously (not round-robin) so each shard's file-open pattern
+    # stays sequential on disk -- doesn't matter much on Kaggle's local SSD,
+    # but avoids surprises with networked storage.
+    shards = [[] for _ in devices]
+    n = len(devices)
+    chunk = (len(valid) + n - 1) // n if n else len(valid)
+    for i, dev in enumerate(devices):
+        shards[i] = valid[i * chunk:(i + 1) * chunk]
+
+    LOG.info(
+        "Splitting %d images across %d device(s): %s",
+        len(valid), n, ", ".join(f"gpu{d}={len(s)}" for d, s in zip(devices, shards))
+    )
+
+    if n <= 1:
+        raw = process_shard(valid, devices[0] if devices else "0", args_dict, "gpu" + (devices[0] if devices else "0"))
+    else:
+        ctx = mp.get_context("spawn")  # required: CUDA + fork don't mix
+        with ctx.Pool(processes=n) as pool:
+            results = pool.starmap(
+                process_shard,
+                [(shards[i], devices[i], args_dict, f"gpu{devices[i]}") for i in range(n)],
+            )
+        raw = [row for shard_result in results for row in shard_result]
+
+    outcomes = [Outcome(**row) for row in raw]
 
     for e in missing:
         outcomes.append(Outcome(

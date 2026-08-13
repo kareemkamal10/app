@@ -124,8 +124,9 @@ def main():
     ap.add_argument("--bucket", required=True)
     ap.add_argument("--batch-count", type=int, default=10)
     ap.add_argument("--workers", type=int, default=16)
-    ap.add_argument("--device", default="0")
-    ap.add_argument("--batch-size", type=int, default=32)
+    ap.add_argument("--devices", default="0,1",
+                     help="Comma-separated GPU ids passed through to 02_detect_faces.py, e.g. '0,1' for T4 x2.")
+    ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--work-dir", default="./pipeline_work")
     args = ap.parse_args()
 
@@ -188,7 +189,7 @@ def main():
             "--download-report", str(download_report),
             "--report-dir", str(reports),
             "--batch-index", str(batch),
-            "--device", args.device,
+            "--devices", args.devices,
             "--batch-size", str(args.batch_size),
         ])
 
