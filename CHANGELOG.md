@@ -65,3 +65,10 @@ JSON performer records
 → update checkpoint
 → delete local batch
 → continue to the next batch
+### Bucket checkpoint / resume repair
+
+- Fixed checkpoint uploads to use the Hugging Face Bucket API.
+- Fixed checkpoint downloads and remote production-batch checks to use Bucket APIs.
+- Added recovery for production batches that are already uploaded but missing from the master checkpoint.
+- Batch 00 from the smoke test is ignored by production resume logic.
+- Local completion markers are written only after a checkpoint upload succeeds.

@@ -95,3 +95,13 @@ Kaggle sessions do not keep local disk between restarts, so resume state lives o
   `batches/batch_XX/batch_XX.parquet`.
 
 If a previous checkpoint from the old encrypted version contains `.parquet.enc`, it should not be treated as a completed batch for the new unencrypted format.
+
+## Smoke-test batch 00
+
+`batch_00` is reserved for the optional isolated smoke test. It is not one of the 10 production batches and is intentionally ignored by production resume logic. It is safe to leave it in the Bucket while the real pipeline processes `batch_01` through `batch_10`.
+
+The production pipeline only considers `batch_01` through `batch_10` when deciding which batches are complete.
+
+## Master checkpoint
+
+The master checkpoint files under `final/` are uploaded directly to the Hugging Face Bucket using the Bucket API. They are not uploaded through the Dataset repository API. If a session stops after a batch has uploaded successfully but before its checkpoint is written, the next run can recover the existing production batch from the Bucket and continue without reprocessing it.
