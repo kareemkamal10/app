@@ -3,8 +3,9 @@
 """
 Download one deterministic batch of performer images.
 
-The batch is selected by performer records, using cumulative image count so
-the ten batches are approximately equal in number of listed image URLs.
+Each batch is selected by performer records, not by individual images.
+Every performer belongs to exactly one batch, and all of that performer's
+image_urls are downloaded together.
 
 Output:
   reports/batch_XX_download_report.json
@@ -107,25 +108,26 @@ def load_json(source: str, timeout: int) -> list:
     return data
 
 
-def select_batch(performers: list, batch_index: int, batch_count: int) -> tuple[list, int, int]:
-    counts = [len(p.get("image_urls") or []) for p in performers]
-    total = sum(counts)
-    start_target = total * (batch_index - 1) / batch_count
-    end_target = total * batch_index / batch_count
+def select_batch(performers: list, batch_index: int, batch_count: int) -> tuple[list, int, int, int, int]:
+    """Split the JSON records into deterministic, balanced performer batches.
 
-    selected = []
-    cumulative = 0
-    for p, n in zip(performers, counts):
-        next_cumulative = cumulative + n
-        # Keep performer records intact; assign by midpoint of their image span.
-        midpoint = (cumulative + next_cumulative) / 2
-        if start_target <= midpoint < end_target or (
-            batch_index == batch_count and midpoint == end_target
-        ):
-            selected.append(p)
-        cumulative = next_cumulative
+    The split is based ONLY on performer position in the JSON, so a performer
+    can never be split across batches. Every image_url belonging to a selected
+    performer is therefore processed in that same batch.
+    """
+    total_performers = len(performers)
+    base, remainder = divmod(total_performers, batch_count)
 
-    return selected, total, sum(len(p.get("image_urls") or []) for p in selected)
+    # First `remainder` batches get one extra performer. For 108,335 / 10,
+    # batches 1-5 contain 10,834 performers and batches 6-10 contain 10,833.
+    before = (batch_index - 1) * base + min(batch_index - 1, remainder)
+    size = base + (1 if batch_index <= remainder else 0)
+    after = before + size
+
+    selected = performers[before:after]
+    total_images_global = sum(len(p.get("image_urls") or []) for p in performers)
+    images_in_batch = sum(len(p.get("image_urls") or []) for p in selected)
+    return selected, total_performers, size, total_images_global, images_in_batch
 
 
 def existing_results(path: Path) -> dict:
@@ -196,7 +198,8 @@ def download_one(session: requests.Session, task: ImageTask, timeout: int, min_b
 
 
 def write_reports(batch: int, report_dir: Path, results: list, selected: list,
-                  total_global: int, total_batch: int, batch_count: int) -> None:
+                  total_performers_global: int, total_images_global: int,
+                  images_in_batch: int, batch_count: int) -> None:
     report_dir.mkdir(parents=True, exist_ok=True)
     ok = [r for r in results if r.success]
     failed = [r for r in results if not r.success]
@@ -205,15 +208,16 @@ def write_reports(batch: int, report_dir: Path, results: list, selected: list,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "batch_index": batch,
         "batch_count": batch_count,
-        "total_images_global": total_global,
-        "listed_images_in_batch": total_batch,
+        "total_performers_global": total_performers_global,
+        "performers_in_batch": len(selected),
+        "total_images_global": total_images_global,
+        "listed_images_in_batch": images_in_batch,
         "attempted_images": len(results),
         "download_success": len(ok),
         "download_failed": len(failed),
         "bytes_downloaded": sum(r.bytes_downloaded for r in results),
         "successful_images": [asdict(r) for r in ok],
         "failed_images": [asdict(r) for r in failed],
-        "performers_in_batch": len(selected),
         "performer_ids": [str(p.get("id")) for p in selected],
     }
     json_path = report_dir / f"batch_{batch:02d}_download_report.json"
@@ -223,8 +227,10 @@ def write_reports(batch: int, report_dir: Path, results: list, selected: list,
 
     md = [
         f"# Batch {batch:02d} download report",
-        f"- Global listed images: **{total_global}**",
-        f"- Listed images in batch: **{total_batch}**",
+        f"- Global performers: **{total_performers_global}**",
+        f"- Performers in batch: **{len(selected)}**",
+        f"- Global listed images: **{total_images_global}**",
+        f"- Listed images in batch: **{images_in_batch}**",
         f"- Successful: **{len(ok)}**",
         f"- Failed: **{len(failed)}**",
         f"- Bytes downloaded: **{report['bytes_downloaded']}**",
@@ -257,12 +263,14 @@ def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
     performers = load_json(args.json_source, args.timeout)
-    selected, total_global, total_batch = select_batch(
+    (selected, total_performers_global, performers_in_batch,
+     total_images_global, images_in_batch) = select_batch(
         performers, args.batch_index, args.batch_count
     )
     LOG.info(
-        "Batch %d/%d: %d performers, %d listed images (global %d)",
-        args.batch_index, args.batch_count, len(selected), total_batch, total_global
+        "Batch %d/%d: %d performers | %d listed images (global %d)",
+        args.batch_index, args.batch_count, performers_in_batch,
+        images_in_batch, total_images_global
     )
 
     results_path = Path(args.report_dir) / f"batch_{args.batch_index:02d}_download_results.jsonl"
@@ -311,7 +319,7 @@ def main() -> int:
     ) for x in merged_map.values()]
     write_reports(
         args.batch_index, Path(args.report_dir), merged_results, selected,
-        total_global, total_batch, args.batch_count
+        total_performers_global, total_images_global, images_in_batch, args.batch_count
     )
 
     failed = sum(1 for r in merged_results if not r.success)

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Upload one encrypted batch and its face report to a Hugging Face Bucket."""
+"""Upload one Parquet batch and its face report to a Hugging Face Bucket."""
 
 import argparse
 import os

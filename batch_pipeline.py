@@ -71,7 +71,7 @@ def remote_batch_complete(bucket: str, token: str, batch: int) -> bool:
     from huggingface_hub import HfApi
     api = HfApi(token=token)
     prefix = f"batches/batch_{batch:02d}"
-    package_remote = f"{prefix}/batch_{batch:02d}.parquet.enc"
+    package_remote = f"{prefix}/batch_{batch:02d}.parquet"
     report_remote = f"{prefix}/batch_{batch:02d}_face_detection_report.json"
     try:
         infos = list(api.get_paths_info(
@@ -130,7 +130,7 @@ def main():
     ap.add_argument("--work-dir", default="./pipeline_work")
     args = ap.parse_args()
 
-    required = ["HF_TOKEN", "PARQUET_PASSWORD"]
+    required = ["HF_TOKEN"]
     missing = [x for x in required if not os.environ.get(x)]
     if missing:
         raise RuntimeError("Missing required environment variables: " + ", ".join(missing))
@@ -161,7 +161,14 @@ def main():
             "batches": [],
         }
 
-    done_batches = {b["batch_index"] for b in master["batches"]}
+    # Only treat a checkpoint as complete when it points to the current
+    # plaintext Parquet format. Older checkpoints may contain .parquet.enc
+    # from the previous encrypted version and must be rebuilt.
+    done_batches = {
+        b["batch_index"]
+        for b in master["batches"]
+        if str(b.get("parquet", "")).endswith(".parquet")
+    }
 
     for batch in range(1, args.batch_count + 1):
         marker = state / f"batch_{batch:02d}.uploaded.ok"
@@ -202,12 +209,12 @@ def main():
             "--batch-index", str(batch),
         ])
 
-        encrypted = package / f"batch_{batch:02d}.parquet.enc"
+        parquet = package / f"batch_{batch:02d}.parquet"
 
         run([
             sys.executable, "04_upload_batch.py",
             "--bucket", args.bucket,
-            "--package", str(encrypted),
+            "--package", str(parquet),
             "--face-report", str(face_report),
             "--batch-index", str(batch),
         ])
@@ -216,8 +223,8 @@ def main():
         if downloads.exists():
             shutil.rmtree(downloads)
             downloads.mkdir(parents=True, exist_ok=True)
-        if encrypted.exists():
-            encrypted.unlink()
+        if parquet.exists():
+            parquet.unlink()
 
         marker.write_text(
             datetime.now(timezone.utc).isoformat(), encoding="utf-8"
@@ -238,7 +245,7 @@ def main():
             "face_not_detected": fr["face_not_detected"],
             "download_report": download_report.name,
             "face_report": face_report.name,
-            "parquet": f"batches/batch_{batch:02d}/batch_{batch:02d}.parquet.enc",
+            "parquet": f"batches/batch_{batch:02d}/batch_{batch:02d}.parquet",
         })
         master["batches"].sort(key=lambda b: b["batch_index"])
 

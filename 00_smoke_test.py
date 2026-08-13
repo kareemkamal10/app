@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Smoke test: run the FULL pipeline (download -> detect -> package/encrypt ->
+Smoke test: run the FULL pipeline (download -> detect -> package ->
 upload -> verify) on a small slice of images, end to end, in a completely
 isolated location.
 
@@ -152,12 +152,12 @@ def main() -> int:
         "--batch-index", "0",
     ])
 
-    encrypted = package / "batch_00.parquet.enc"
+    parquet = package / "batch_00.parquet"
 
     run([
         sys.executable, str(HERE / "04_upload_batch.py"),
         "--bucket", args.bucket,
-        "--package", str(encrypted),
+        "--package", str(parquet),
         "--face-report", str(face_report),
         "--batch-index", "0",
     ])
