@@ -162,8 +162,7 @@ def main():
         }
 
     # Only treat a checkpoint as complete when it points to the current
-    # plaintext Parquet format. Older checkpoints may contain .parquet.enc
-    # from the previous encrypted version and must be rebuilt.
+    # plaintext Parquet format.
     done_batches = {
         b["batch_index"]
         for b in master["batches"]
